@@ -1,114 +1,57 @@
 # RFC 0001 – Decisões Técnicas de Arquitetura
 
 ## Status
-**Aprovado**
+**Aprovado / Atualizado (Tech Challenge)**
 
 ## Autor
 Equipe de Arquitetura
 
 ## Data
-2026-01-02
+2026
 
 ---
 
 ## 1. Contexto
 
-Este documento tem como objetivo registrar e justificar decisões técnicas relevantes adotadas no projeto, seguindo o modelo de **RFC (Request for Comments)**. O uso de RFCs permite documentar escolhas arquiteturais de forma clara, rastreável e alinhada às boas práticas de engenharia de software.
+A aplicação original foi concebida com uma arquitetura monolítica para facilitar a validação inicial do modelo de negócio (Sistema de Oficina Mecânica). [cite_start]Com o crescimento da complexidade, a necessidade de integração com provedores externos de pagamento e a exigência de maior escalabilidade, o projeto precisou evoluir.
 
-As decisões aqui descritas impactam diretamente aspectos de **segurança, escalabilidade, confiabilidade e manutenção** da solução.
+Este documento registra as decisões tomadas durante o processo de estrangulamento (*Strangler Fig Pattern*) do monólito, resultando na atual arquitetura orientada a microsserviços.
 
----
+## 2. Decisões Arquiteturais
 
-## 2. Decisão 1 – Escolha da Nuvem: AWS (Amazon Web Services)
+### 2.1. Decomposição em Microsserviços (Domain-Driven Design)
+[cite_start]Foi decidido dividir a aplicação em três microsserviços distintos, baseados nos subdomínios do negócio:
+* [cite_start]**Work Order Service (Core):** Responsável por gerenciar Ordens de Serviço, Clientes, Veículos e Mecânicos. [cite_start]Centraliza o fluxo principal do negócio e evita que seja sobrecarregado com lógicas de terceiros.
+* **Stock Service:** Responsável por gerenciar o catálogo de peças e o inventário. [cite_start]O controle de concorrência ganha escalabilidade independente, blindando o serviço core contra problemas de *locks* no banco de dados.
+* **Payment Service:** Atua como uma Camada Anticorrupção (*Anti-Corruption Layer*) processando pagamentos e integrando com o provedor externo (Mercado Pago). [cite_start]Isola o sistema central de possíveis instabilidades e mudanças de contrato da API terceira.
 
-### 2.1 Decisão
+### 2.2. API Gateway
+[cite_start]Adotamos o uso de um API Gateway como único ponto de entrada unificado para clientes e front-ends externos.
+* [cite_start]**Justificativa:** Facilita o roteamento das requisições síncronas (HTTP/REST) para os respectivos microsserviços  e abstrai a complexidade da rede interna do cluster Kubernetes.
 
-Utilizar a **AWS (Amazon Web Services)** como provedora de infraestrutura em nuvem do projeto.
+### 2.3. Padrão Saga (Coreografia) com AWS SQS
+[cite_start]Como o banco de dados foi segregado, o ciclo de vida de uma Ordem de Serviço passou a exigir uma **transação distribuída**  (criar a OS, reservar as peças e realizar a cobrança). [cite_start]Optamos pela abordagem de **Saga Coreografada**.
+* [cite_start]**Justificativa:** Diferente da orquestração, a coreografia elimina o risco e gargalo de um ponto central único de falha. Os serviços assinam e publicam eventos de forma totalmente isolada.
+* [cite_start]**Tecnologia:** Adotamos o **AWS SQS** como Message Broker para a comunicação assíncrona orientada a eventos, garantindo a tolerância a falhas (via Dead Letter Queues) para retentativas de processos como estorno de peças ou falhas de pagamento.
 
-### 2.2 Justificativa
+### 2.4. Segregação de Dados (*Database per Service*)
+[cite_start]Cada microsserviço agora possui seu próprio banco de dados isolado.
+* **PostgreSQL:** Escolhido para o `Work Order Service` e o `Stock Service`. [cite_start]A garantia de integridade ACID continua sendo essencial para o cadastro cruzado de clientes/veículos e para a reserva precisa de peças no inventário. [cite_start]O versionamento de migrações é gerenciado via **Liquibase**.
+* **Amazon DynamoDB (NoSQL):** Escolhido para o `Payment Service`.
+  * [cite_start]**Justificativa:** Necessidade de alta performance de leitura/escrita e adaptação nativa à natureza estruturada em documentos/JSON das transações financeiras e *payloads* flexíveis de logs do webhook do Mercado Pago.
 
-A AWS foi escolhida por ser uma das plataformas de nuvem mais consolidadas e amplamente utilizadas no mundo, adotada por empresas de diversos portes e segmentos. Os principais fatores que motivaram essa decisão são:
+### 2.5. Infraestrutura e Observabilidade
+[cite_start]Para viabilizar a operação e a manutenibilidade da nova arquitetura distribuída, definimos a seguinte base:
+* [cite_start]**Linguagem Principal:** Java com Spring Boot.
+* **Containerização e Orquestração:** Docker e **Kubernetes (K8s)**. [cite_start]Faremos uso de *Deployments*, *Services* e HPA (*Horizontal Pod Autoscaler*) para garantir a alta disponibilidade.
+* [cite_start]**Infrastructure as Code (IaC):** Uso de **Terraform** para o provisionamento dos ambientes e garantia de recursos reprodutíveis na nuvem AWS.
+* [cite_start]**Monitoramento/Observabilidade:** Uso do **Datadog**, permitindo o rastreamento das requisições (*distributed tracing*) e o monitoramento da saúde dos três microsserviços no ecossistema.
 
-- **Alta confiabilidade e disponibilidade**, com infraestrutura distribuída globalmente (Regions e Availability Zones).
-- **Modelo de segurança robusto**, baseado em IAM, VPC, criptografia em repouso e em trânsito, além de conformidade com padrões internacionais (ISO, SOC, PCI-DSS, entre outros).
-- **Ecossistema maduro de serviços gerenciados**, reduzindo a sobrecarga operacional.
-- **Escalabilidade sob demanda**, permitindo crescimento do sistema sem necessidade de reestruturações complexas.
+## 3. Consequências
 
-### 2.3 Consequências
-
-- Dependência do ecossistema AWS (lock-in aceitável para o contexto do projeto).
-- Redução de esforço operacional e maior foco no desenvolvimento da aplicação.
-
----
-
-## 3. Decisão 2 – Banco de Dados: PostgreSQL
-
-### 3.1 Decisão
-
-Adotar o **PostgreSQL** como banco de dados relacional principal do projeto.
-
-### 3.2 Justificativa
-
-O PostgreSQL foi escolhido por ser um banco de dados **open source, maduro e amplamente utilizado em ambientes corporativos**, oferecendo:
-
-- **Alta robustez e estabilidade**, comprovadas por anos de uso em sistemas críticos.
-- **Recursos avançados de segurança**, como controle granular de permissões, autenticação forte e suporte a criptografia.
-- **Excelente suporte a integridade de dados**, transações ACID e consistência.
-- **Compatibilidade com serviços gerenciados da AWS**, como o Amazon RDS, facilitando backup, monitoramento e escalabilidade.
-
-### 3.3 Consequências
-
-- Curva de aprendizado moderada para equipes sem experiência prévia.
-- Forte confiabilidade dos dados e facilidade de manutenção a longo prazo.
-
----
-
-## 4. Decisão 3 – Estratégia de Autenticação e Autorização
-
-### 4.1 Decisão
-
-Implementar uma estratégia de autenticação baseada em:
-
-- **AWS API Gateway** como ponto de entrada das requisições
-- **AWS Lambda** responsável pela geração e validação de tokens
-- **JWT (JSON Web Token)** como mecanismo de autenticação
-
-### 4.2 Arquitetura Proposta
-
-1. O cliente realiza uma requisição de autenticação via **API Gateway**.
-2. O API Gateway encaminha a requisição para uma **Lambda Function**.
-3. A Lambda valida as credenciais do usuário.
-4. Em caso de sucesso, é gerado um **token JWT** assinado.
-5. O token é retornado ao cliente e utilizado nas requisições subsequentes.
-
-### 4.3 Justificativa
-
-Essa abordagem foi escolhida pelos seguintes motivos:
-
-- **Desacoplamento da lógica de autenticação** da aplicação principal.
-- **Escalabilidade automática**, inerente ao modelo serverless das Lambdas.
-- **Redução de custos**, pois o modelo é baseado em uso sob demanda.
-- **JWT é stateless**, eliminando a necessidade de armazenamento de sessão no servidor.
-- **Integração nativa com serviços AWS**, incluindo authorizers no API Gateway.
-
-### 4.4 Consequências
-
-- Necessidade de cuidado com a gestão de chaves e tempo de expiração do token.
-- Maior segurança e padronização do fluxo de autenticação.
-
----
-
-## 5. Considerações Finais
-
-As decisões documentadas neste RFC priorizam **segurança, confiabilidade, escalabilidade e manutenibilidade**, alinhando o projeto a práticas modernas de arquitetura em nuvem e desenvolvimento de software.
-
-Este documento deve ser atualizado sempre que decisões arquiteturais relevantes forem revisadas ou alteradas.
-
----
-
-## 6. Referências
-
-- https://aws.amazon.com
-- https://www.postgresql.org
-- https://jwt.io
-
+* **Positivas:**
+  * Altíssimo isolamento de falhas: indisponibilidade no Mercado Pago ou queda do banco de estoque não impede que usuários continuem acessando ou consultando OSs finalizadas.
+  * Escalabilidade granular: em momentos de pico, podemos escalar apenas o serviço necessário (ex: `Stock Service` durante entrada de inventário) sem gastar recursos com a aplicação inteira.
+* **Negativas / Desafios:**
+  * Complexidade operacional aumentada. A entrega agora depende de *pipelines* de CI/CD orquestradas para múltiplos repositórios.
+  * O sistema agora lida com "consistência eventual". Operações não ocorrem mais em uma transação síncrona única, o que exige das interfaces client-side um tratamento mais inteligente (ex: status pendente aguardando a fila processar).
